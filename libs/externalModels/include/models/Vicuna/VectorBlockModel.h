@@ -53,6 +53,7 @@ private:
   // Vector signal timestamps
   uint64_t vsetSignal = 0;
   uint64_t wbFreeSignal = 0;
+  uint64_t memArbiterSignal = 0;
 
   auto getVs1() -> uint64_t { return vs1_ptr[getInstrIndex()]; }
 
@@ -231,6 +232,11 @@ public:
 
   void setVsetSignal(uint64_t timestamp) { vsetSignal = timestamp - 1; }
   auto getVsetSignal() -> uint64_t { return vsetSignal; };
+
+  auto setMemArbiterSignal(uint64_t timestamp) -> void {
+    memArbiterSignal = timestamp;
+  }
+  auto getMemArbiterSignal() -> uint64_t { return memArbiterSignal; };
 
   auto getVBlockALU_i() -> uint64_t {
     auto const batchDelay = vlen_ / vlane_width_;

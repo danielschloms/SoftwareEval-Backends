@@ -28,7 +28,7 @@
 #include "PerformanceModel.h"
 #include "VectorConfig.h"
 
-// #define PRINT_REG_COMMITS
+#define PRINT_REG_COMMITS
 
 #ifdef PRINT_REG_COMMITS
 #define CPRINT(...) std::printf(__VA_ARGS__)
@@ -42,18 +42,24 @@ class VectorBlockModel : public ConnectorModel {
 private:
   uint64_t vlen_ = 0;
   uint64_t vlane_width_ = 0;
+  uint64_t unpack_1_depth = 3;
+  uint64_t unpack_2_depth = 3;
 
   // Vector register timestamps
   std::array<uint64_t, 32> vectorRegisterReads{0};
   std::array<uint64_t, 32> vectorRegisterWrites{0};
 
   // Vector control timestamps
-  uint64_t blockEntry = 0;
+  // uint64_t timestamp = 0;
 
   // Vector signal timestamps
   uint64_t vsetSignal = 0;
   uint64_t wbFreeSignal = 0;
   uint64_t memArbiterSignal = 0;
+
+  // Dispatch OK times
+  uint64_t dispatch_1_ready = 0;
+  uint64_t dispatch_2_ready = 0;
 
   auto getVs1() -> uint64_t { return vs1_ptr[getInstrIndex()]; }
 
@@ -159,6 +165,12 @@ public:
       : ConnectorModel("VectorBlockModel", parent_) {
     vlen_ = std::stoi(std::getenv("VLEN"));
     vlane_width_ = std::stoi(std::getenv("VLANE_WIDTH"));
+    if (vlane_width_ * 2 >= vlen_) {
+      unpack_2_depth--;
+    }
+    // if (VectorConfig::vMemWidth * 2 >= vlen_) {
+    //   unpack_1_depth--;
+    // }
   };
 
   uint64_t *vs1_ptr;
@@ -174,58 +186,149 @@ public:
   // Whole register loads
   uint64_t *nf_ptr;
 
-#define VFU_VV(name, batchDelay_, emul_)                                       \
-  auto getVBlock##name##_vv()->uint64_t {                                      \
-    auto const batchDelay = batchDelay_;                                       \
-    auto const emul = emul_;                                                   \
-    auto const vs1 = getVs1();                                                 \
-    auto const vs2 = getVs2();                                                 \
-    auto const vd = getVd();                                                   \
-    auto batchStart = blockEntry + 3;                                          \
-    for (size_t i = 0; i < emul; ++i) {                                        \
-      auto const maxWriteDependency = std::max(vectorRegisterWrites[vs1 + i],  \
-                                               vectorRegisterWrites[vs2 + i]); \
-      batchStart = std::max(batchStart, maxWriteDependency + 1);               \
-      vectorRegisterReads[vs1 + i] = batchStart;                               \
-      vectorRegisterReads[vs2 + i] = batchStart;                               \
-      auto const doneTime =                                                    \
-          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]) + 2;  \
-      vectorRegisterWrites[vd + i] = doneTime;                                 \
-      batchStart = doneTime;                                                   \
-    }                                                                          \
-    return batchStart;                                                         \
+  auto setVBlockDIV_vv(uint64_t timestamp) -> void {
+    auto const batchDelay = vlen_ / vlane_width_;
+    auto const emul = getLmul();
+    auto const vs1 = getVs1();
+    auto const vs2 = getVs2();
+    auto const vd = getVd();
+    static constexpr auto pipeline_depth = 5;
+    auto batchStart = timestamp + unpack_2_depth;
+    CPRINT("---\nALU\n---\n");
+    for (size_t i = 0; i < emul; ++i) {
+      auto const maxWriteDependency = std::max(vectorRegisterWrites[vs1 + i],
+                                               vectorRegisterWrites[vs2 + i]);
+      batchStart =
+          std::max(batchStart, maxWriteDependency + 1 + unpack_2_depth);
+      CPRINT("Issue @ %lu\n", batchStart);
+      vectorRegisterReads[vs1 + i] = batchStart;
+      vectorRegisterReads[vs2 + i] = batchStart;
+      auto const doneTime =
+          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
+      batchStart = doneTime;
+    }
   }
 
-#define VFU_VX(name, batchDelay_, emul_)                                       \
-  auto getVBlock##name##_vx()->uint64_t {                                      \
-    auto const batchDelay = batchDelay_;                                       \
-    auto const emul = emul_;                                                   \
-    auto const vs2 = getVs2();                                                 \
-    auto const vd = getVd();                                                   \
-    auto batchStart = blockEntry;                                              \
-    for (size_t i = 0; i < emul; ++i) {                                        \
-      batchStart = std::max(batchStart, vectorRegisterWrites[vs2 + i]);        \
-      vectorRegisterReads[vs2 + i] = batchStart;                               \
-      auto const doneTime =                                                    \
-          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);      \
-      vectorRegisterWrites[vd + i] = doneTime;                                 \
-      batchStart = doneTime;                                                   \
-    }                                                                          \
-    return batchStart;                                                         \
+  auto setVBlockDIV_vx(uint64_t timestamp) -> void {
+    auto const batchDelay = vlen_ / vlane_width_;
+    auto const emul = getLmul();
+    auto const vs2 = getVs2();
+    auto const vd = getVd();
+    static constexpr auto pipeline_depth = 5;
+    auto batchStart = timestamp + unpack_2_depth;
+    CPRINT("---\nDIV VX\n---\n");
+    for (size_t i = 0; i < emul; ++i) {
+      batchStart = std::max(batchStart,
+                            vectorRegisterWrites[vs2 + i] + unpack_2_depth + 1);
+      CPRINT("Issue @ %lu\n", batchStart);
+      vectorRegisterReads[vs2 + i] = batchStart;
+      auto const doneTime =
+          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
+      batchStart = doneTime;
+    }
+    dispatch_2_ready = batchStart;
   }
 
-  VFU_VV(ALU, vlen_ / vlane_width_, getLmul())
-  VFU_VX(ALU, vlen_ / vlane_width_, getLmul())
+  auto setVBlockALU_vv(uint64_t timestamp) -> void {
+    auto const batchDelay = vlen_ / vlane_width_;
+    auto const emul = getLmul();
+    auto const vs1 = getVs1();
+    auto const vs2 = getVs2();
+    auto const vd = getVd();
+    static constexpr auto pipeline_depth = 5;
+    auto batchStart = timestamp + unpack_2_depth;
+    // TODO FIX:
+    // resolve dependencies in first unpack stage!
+    CPRINT("---\nALU\n---\n");
+    for (size_t i = 0; i < emul; ++i) {
+      auto const maxWriteDependency = std::max(vectorRegisterWrites[vs1 + i],
+                                               vectorRegisterWrites[vs2 + i]);
+      batchStart =
+          std::max(batchStart, maxWriteDependency + 1 + unpack_2_depth);
+      CPRINT("Issue @ %lu\n", batchStart);
+      vectorRegisterReads[vs1 + i] = batchStart;
+      vectorRegisterReads[vs2 + i] = batchStart;
+      auto const doneTime =
+          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
+      batchStart = doneTime;
+    }
+  }
 
-  VFU_VV(MUL, vlen_ / vlane_width_, getLmul())
-  VFU_VX(MUL, vlen_ / vlane_width_, getLmul())
+  auto setVBlockALU_vx(uint64_t timestamp) -> void {
+    auto const batchDelay = vlen_ / vlane_width_;
+    auto const emul = getLmul();
+    auto const vs2 = getVs2();
+    auto const vd = getVd();
+    static constexpr auto pipeline_depth = 5;
+    auto batchStart = timestamp + unpack_2_depth;
+    CPRINT("---\nALU VX\n---\n");
+    for (size_t i = 0; i < emul; ++i) {
+      batchStart = std::max(batchStart,
+                            vectorRegisterWrites[vs2 + i] + unpack_2_depth + 1);
+      CPRINT("Issue @ %lu\n", batchStart);
+      vectorRegisterReads[vs2 + i] = batchStart;
+      auto const doneTime =
+          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
+      batchStart = doneTime;
+    }
+    dispatch_2_ready = batchStart - unpack_2_depth - 1;
+  }
 
-  VFU_VV(DIV, vlen_ / vlane_width_, getLmul())
-  VFU_VX(DIV, vlen_ / vlane_width_, getLmul())
+  auto setVBlockMUL_vv(uint64_t timestamp) -> void {
+    auto const batchDelay = vlen_ / vlane_width_;
+    auto const emul = getLmul();
+    auto const vs1 = getVs1();
+    auto const vs2 = getVs2();
+    auto const vd = getVd();
+    static constexpr auto pipeline_depth = 6;
+    auto batchStart = timestamp + unpack_2_depth;
+    CPRINT("---\nMUL\n---\n");
+    for (size_t i = 0; i < emul; ++i) {
+      auto const maxWriteDependency = std::max(vectorRegisterWrites[vs1 + i],
+                                               vectorRegisterWrites[vs2 + i]);
+      batchStart =
+          std::max(batchStart, maxWriteDependency + unpack_2_depth + 1);
+      CPRINT("Issue @ %lu\n", batchStart);
+      vectorRegisterReads[vs1 + i] = batchStart - 1;
+      vectorRegisterReads[vs2 + i] = batchStart - 1;
+      auto const doneTime =
+          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
+      batchStart = doneTime;
+    }
+    dispatch_2_ready = batchStart - unpack_2_depth - 1;
+  }
 
-  VFU_VV(ELM, vlen_ / getSew(), getLmul())
-
-  auto setBlockEntry(uint64_t timestamp) -> void { blockEntry = timestamp; }
+  auto setVBlockMUL_vx(uint64_t timestamp) -> void {
+    auto const batchDelay = vlen_ / vlane_width_;
+    auto const emul = getLmul();
+    auto const vs2 = getVs2();
+    auto const vd = getVd();
+    static constexpr auto pipeline_depth = 6;
+    auto batchStart = timestamp + unpack_2_depth;
+    CPRINT("---\nALU VX\n---\n");
+    for (size_t i = 0; i < emul; ++i) {
+      batchStart = std::max(batchStart,
+                            vectorRegisterWrites[vs2 + i] + unpack_2_depth + 1);
+      CPRINT("Issue @ %lu\n", batchStart);
+      vectorRegisterReads[vs2 + i] = batchStart;
+      auto const doneTime =
+          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
+      batchStart = doneTime;
+    }
+    dispatch_2_ready = batchStart - unpack_2_depth - 1;
+  }
 
   auto getWbFreeSignal(void) -> uint64_t { return wbFreeSignal; }
   auto setWbFreeSignal(uint64_t timestamp) -> void { wbFreeSignal = timestamp; }
@@ -238,122 +341,191 @@ public:
   }
   auto getMemArbiterSignal() -> uint64_t { return memArbiterSignal; };
 
-  auto getVBlockALU_i() -> uint64_t {
+  auto setVBlockELM_vv(uint64_t timestamp) -> void {
+    auto const batchDelay = vlen_ / getSew();
+    auto const emul = getLmul();
+    auto const vs1 = getVs1();
+    auto const vs2 = getVs2();
+    auto const vd = getVd();
+    auto batchStart = timestamp + unpack_1_depth;
+    static constexpr auto pipeline_depth = 5;
+    for (size_t i = 0; i < emul; ++i) {
+      auto const maxWriteDependency = std::max(vectorRegisterWrites[vs1 + i],
+                                               vectorRegisterWrites[vs2 + i]);
+      batchStart = std::max(batchStart, maxWriteDependency + 1);
+      vectorRegisterReads[vs1 + i] = batchStart - 1;
+      vectorRegisterReads[vs2 + i] = batchStart - 1;
+      auto const doneTime =
+          std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
+      batchStart = doneTime;
+    }
+
+    for (size_t i = 0; i < emul; ++i) {
+      vectorRegisterWrites[vd + i] = batchStart + batchDelay + pipeline_depth;
+    }
+    dispatch_1_ready = batchStart;
+  }
+
+  auto setVBlockVMV_V_I(uint64_t timestamp) -> void {
     auto const batchDelay = vlen_ / vlane_width_;
     auto const emul = getLmul();
     auto const vd = getVd();
-
-    auto batchStart = blockEntry;
+    static constexpr auto pipeline_depth = 5;
+    auto batchStart = timestamp + unpack_2_depth;
+    CPRINT("---\nvmv.v.i\n---\n");
     for (size_t i = 0; i < emul; ++i) {
-      // Update write time for vd, stalls if parallel unit reads from same
-      // register
+      CPRINT("Issue @ %lu\n", batchStart);
       auto const doneTime =
           std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
-      vectorRegisterWrites[vd + i] = doneTime;
-      // Increment start for next batch by batch delay
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
       batchStart = doneTime;
     }
-    return batchStart;
+    dispatch_2_ready = batchStart - unpack_2_depth - 1;
   }
 
-  auto getVBlockVMV_S_X() -> uint64_t {
+  // Scalar -> Vector
+  auto setVBlockVMV_S_X(uint64_t timestamp) -> void {
     auto const batchDelay = vlen_ / vlane_width_;
     auto const vd = getVd();
-    auto const doneTime =
-        std::max(blockEntry + batchDelay, vectorRegisterReads[vd]);
-    vectorRegisterWrites[vd] = doneTime;
-    return doneTime;
+    static constexpr auto pipeline_depth = 5;
+    vectorRegisterWrites[vd] =
+        timestamp + unpack_2_depth + batchDelay + pipeline_depth;
+    dispatch_2_ready = timestamp;
   }
 
-  auto getVBlockVMV_X_S() -> uint64_t {
+  // Vector -> Scalar
+  auto setVBlockVMV_X_S(uint64_t timestamp) -> void {
     auto const batchDelay = 1;
     auto const vs2 = getVs2();
-    auto const batchStart = std::max(blockEntry, vectorRegisterWrites[vs2]);
-    auto const doneTime = batchStart + batchDelay;
-    vectorRegisterReads[vs2] = batchStart;
-    return doneTime;
+    auto const batchStart = std::max(timestamp, vectorRegisterWrites[vs2] + 1);
+    vectorRegisterReads[vs2] = batchStart + unpack_1_depth;
+    auto const doneTime = batchStart + unpack_1_depth + batchDelay;
+    wbFreeSignal = doneTime;
+    dispatch_1_ready = batchStart;
   }
 
-  auto getVBlockStore() -> uint64_t {
+  auto setVBlockStore(uint64_t timestamp) -> void {
     auto const batchDelay = vlen_ / VectorConfig::vMemWidth;
     auto const emul = getLoadStoreEmul();
     auto const vs3 = getVs3();
 
-    auto batchStart = blockEntry + 3;
-    static constexpr auto pipelineDepth = 5;
+    auto batchStart = timestamp + unpack_1_depth;
+    static constexpr auto pipeline_depth = 5;
+    CPRINT("---\nStore\n---\n");
     for (size_t i = 0; i < emul; ++i) {
       // Start batch after last batch (or start of block), or after dependencies
       // are resolved
-      batchStart = std::max(batchStart, vectorRegisterWrites[vs3 + i]);
+      batchStart = std::max(batchStart,
+                            vectorRegisterWrites[vs3 + i] + unpack_1_depth + 1);
+      CPRINT("R v%lu @ %lu\n", vs3 + i, vectorRegisterWrites[vs3 + i]);
+      CPRINT("Issue batch @ %lu\n", batchStart);
+
       // Also update read times for vs3 (parallel execution)
       vectorRegisterReads[vs3 + i] = batchStart;
       // Increment start for next batch by batch delay
       batchStart += batchDelay;
     }
-    // xifResultSignal = batchStart + pipelineDepth;
-    return batchStart;
+    wbFreeSignal = batchStart + pipeline_depth;
+    dispatch_1_ready = batchStart;
+    CPRINT("DISP 1 ready @ %lu\n", dispatch_1_ready);
+    CPRINT("WB free @ %lu\n", wbFreeSignal);
   }
 
-  auto getVBlockStoreNf() -> uint64_t {
+  auto setVBlockStoreNf(uint64_t timestamp) -> void {
     auto const batchDelay = vlen_ / VectorConfig::vMemWidth;
     auto const emul = getNf();
     auto const vs3 = getVs3();
 
-    auto batchStart = blockEntry + 3;
-    static constexpr auto pipelineDepth = 5;
+    auto batchStart = timestamp + unpack_1_depth;
+    static constexpr auto pipeline_depth = 5;
+    CPRINT("---\nStore\n---\n");
     for (size_t i = 0; i < emul; ++i) {
       // Start batch after last batch (or start of block), or after dependencies
       // are resolved
-      batchStart = std::max(batchStart, vectorRegisterWrites[vs3 + i]);
+      batchStart = std::max(batchStart,
+                            vectorRegisterWrites[vs3 + i] + unpack_1_depth + 1);
+      CPRINT("R v%lu @ %lu\n", vs3 + i, vectorRegisterWrites[vs3 + i]);
+      CPRINT("Issue batch @ %lu\n", batchStart);
+
       // Also update read times for vs3 (parallel execution)
       vectorRegisterReads[vs3 + i] = batchStart;
       // Increment start for next batch by batch delay
       batchStart += batchDelay;
     }
-    // xifResultSignal = batchStart + pipelineDepth;
-    return batchStart;
+    wbFreeSignal = batchStart + pipeline_depth;
+    dispatch_1_ready = batchStart;
+    CPRINT("DISP 1 ready @ %lu\n", dispatch_1_ready);
+    CPRINT("WB free @ %lu\n", wbFreeSignal);
   }
 
-  auto getVBlockLoad() -> uint64_t {
+  // auto setVBlockStoreNf(uint64_t timestamp) -> void {
+  //   auto const batchDelay = vlen_ / VectorConfig::vMemWidth;
+  //   auto const emul = getNf();
+  //   auto const vs3 = getVs3();
+
+  //   auto batchStart = timestamp + 3;
+  //   static constexpr auto pipeline_depth = 5;
+  //   for (size_t i = 0; i < emul; ++i) {
+  //     // Start batch after last batch (or start of block), or after
+  //     dependencies
+  //     // are resolved
+  //     batchStart = std::max(batchStart, vectorRegisterWrites[vs3 + i]);
+  //     // Also update read times for vs3 (parallel execution)
+  //     vectorRegisterReads[vs3 + i] = batchStart;
+  //     // Increment start for next batch by batch delay
+  //     batchStart += batchDelay;
+  //   }
+  //   wbFreeSignal = batchStart + pipeline_depth;
+  //   dispatch_1_ready = batchStart;
+  // }
+
+  auto setVBlockLoad(uint64_t timestamp) -> void {
     auto const batchDelay = vlen_ / VectorConfig::vMemWidth;
     auto const emul = getLoadStoreEmul();
     auto const vd = getVd();
 
-    static constexpr auto pipelineDepth = 5;
-    auto batchStart = blockEntry + 3;
+    static constexpr auto pipeline_depth = 5;
+    auto batchStart = timestamp + unpack_1_depth;
+    CPRINT("---\nLoad\n---\n");
     for (size_t i = 0; i < emul; ++i) {
       // Update write time for vd, stalls if parallel unit reads from same
       // register
       auto const doneTime =
           std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
-      vectorRegisterWrites[vd + i] = doneTime + pipelineDepth;
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
       // Increment start for next batch by batch delay
       batchStart = doneTime;
     }
     // Next instruction can enter while batch still in pipeline
     // But to WB is only clear after writing
-    // xifResultSignal = batchStart + pipelineDepth;
-    return batchStart;
+    wbFreeSignal = batchStart + pipeline_depth;
+    dispatch_1_ready = batchStart;
   }
 
-  auto getVBlockLoadNf() -> uint64_t {
+  auto setVBlockLoadNf(uint64_t timestamp) -> void {
     auto const batchDelay = vlen_ / VectorConfig::vMemWidth;
     auto const emul = getNf();
     auto const vd = getVd();
 
-    auto batchStart = blockEntry;
-    static constexpr auto pipelineDepth = 5;
+    static constexpr auto pipeline_depth = 5;
+    auto batchStart = timestamp + unpack_1_depth;
+    CPRINT("---\nLoad NF\n---\n");
     for (size_t i = 0; i < emul; ++i) {
       // Update write time for vd, stalls if parallel unit reads from same
       // register
       auto const doneTime =
           std::max(batchStart + batchDelay, vectorRegisterReads[vd + i]);
-      vectorRegisterWrites[vd + i] = doneTime + pipelineDepth;
+      vectorRegisterWrites[vd + i] = doneTime + pipeline_depth;
+      CPRINT("W v%lu @ %lu\n", vd + i, doneTime + pipeline_depth);
       // Increment start for next batch by batch delay
       batchStart = doneTime;
     }
-    // xifResultSignal = batchStart + pipelineDepth;
-    return batchStart;
+    // Next instruction can enter while batch still in pipeline
+    // But to WB is only clear after writing
+    wbFreeSignal = batchStart + pipeline_depth;
+    dispatch_1_ready = batchStart;
   }
 
   // Get the max. timestamp for a target register group
@@ -362,7 +534,8 @@ public:
     auto const registerBaseIndex = getVd();
     auto start = vectorRegisterWrites.begin() + registerBaseIndex;
     // Ready 1 cycle after register done
-    return (*(std::max_element(start, start + emul))) + 1;
+    return std::max((*(std::max_element(start, start + emul))) + 1,
+                    dispatch_2_ready);
   }
 
   uint64_t getMaxVdGroupWide(void) {
@@ -379,8 +552,13 @@ public:
     auto const registerBaseIndex = getVd();
     auto start = vectorRegisterWrites.begin() + registerBaseIndex;
     // Ready 1 cycle after register done
-    return (*(std::max_element(start, start + nFields))) + 1;
+    return std::max((*(std::max_element(start, start + nFields))) + 1,
+                    dispatch_1_ready);
   }
+
+  uint64_t getDispatch1Ready(void) { return dispatch_1_ready; }
+
+  uint64_t getDispatch2Ready(void) { return dispatch_2_ready; }
 
   // Get the max. timestamp for a register group for load instructions
   uint64_t getMaxVdGroupLoad(void) {
@@ -388,7 +566,8 @@ public:
     auto const registerBaseIndex = getVd();
     auto start = vectorRegisterWrites.begin() + registerBaseIndex;
     // Ready 1 cycle after register done
-    return (*(std::max_element(start, start + emul))) + 1;
+    return std::max((*(std::max_element(start, start + emul))) + 1,
+                    dispatch_1_ready);
   }
 
   auto getWaitTime(uint64_t emul) -> uint64_t {

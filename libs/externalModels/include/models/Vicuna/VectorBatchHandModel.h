@@ -19,13 +19,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
 
 #include "PerformanceModel.h"
-#include "VectorConfig.h"
 
 #define PRINT_REG_COMMITS
 
@@ -39,11 +37,6 @@ namespace Vicuna {
 
 class VectorBatchHandModel : public ConnectorModel {
 private:
-  static constexpr auto pipeline_depth_ALU = 5;
-  static constexpr auto pipeline_depth_MUL = 6;
-  static constexpr auto pipeline_depth_ELM = 5;
-  static constexpr auto pipeline_depth_LSU = 5;
-
   // Vector register timestamps
   // std::array<uint64_t, 32> vectorRegisterReads{0};
   std::array<uint64_t, 32> vectorRegisterWrites{0};
@@ -52,6 +45,7 @@ private:
   uint64_t vsetSignal = 0;
   uint64_t wbFreeSignal = 0;
   uint64_t memArbiterSignal = 0;
+  uint64_t commitSignal = 0;
 
   // Dispatch OK times
   uint64_t dispatch_1_ready = 0;
@@ -130,6 +124,8 @@ public:
 
   // Whole register loads
   uint64_t *nf_ptr;
+  // Whole register moves
+  uint64_t *simm5_ptr;
 
   auto getLmul() -> uint64_t {
     uint64_t const vtype = vtype_ptr[getInstrIndex()];
@@ -183,29 +179,43 @@ public:
 
   // NF = encodedNF + 1
   auto getNf() -> uint64_t { return nf_ptr[getInstrIndex()] + 1; }
+  auto getNfSimm5() -> uint64_t { return simm5_ptr[getInstrIndex()] + 1; }
 
   auto getVs1() -> uint64_t { return vectorRegisterWrites[getVs1Index()]; }
   auto getVs2() -> uint64_t { return vectorRegisterWrites[getVs2Index()]; }
   auto getVs3() -> uint64_t { return vectorRegisterWrites[getVs3Index()]; }
   auto getVs1(unsigned lmulIndex) -> uint64_t {
-    return vectorRegisterWrites[getVs1Index() + lmulIndex] + 1;
+    auto const reg = getVs1Index();
+    auto const val = vectorRegisterWrites[reg + lmulIndex];
+    // std::printf("(Vs1) Get t_v%lu = %lu\n", reg + lmulIndex, val);
+    return val;
   }
   auto getVs2(unsigned lmulIndex) -> uint64_t {
-    return vectorRegisterWrites[getVs2Index() + lmulIndex] + 1;
+    auto const reg = getVs2Index();
+    auto const val = vectorRegisterWrites[reg + lmulIndex];
+    // std::printf("(Vs2) Get t_v%lu = %lu\n", reg + lmulIndex, val);
+    return val;
   }
   auto getVs3(unsigned lmulIndex) -> uint64_t {
-    return vectorRegisterWrites[getVs3Index() + lmulIndex] + 1;
+    auto const reg = getVs3Index();
+    auto const val = vectorRegisterWrites[reg + lmulIndex];
+    // std::printf("(Vs3) Get t_v%lu = %lu\n", reg + lmulIndex, val);
+    return val;
   }
 
   auto setVd(uint64_t timestamp) {
     vectorRegisterWrites[getVdIndex()] = timestamp;
   }
   auto setVd(unsigned lmulIndex, uint64_t timestamp) {
-    vectorRegisterWrites[getVdIndex() + lmulIndex] = timestamp;
+    auto const reg = getVdIndex();
+    vectorRegisterWrites[reg + lmulIndex] = timestamp + 1;
+    // std::printf("Set t_v%lu = %lu\n", reg + lmulIndex, timestamp + 1);
   }
 
   auto getWbFreeSignal(void) -> uint64_t { return wbFreeSignal; }
-  auto setWbFreeSignal(uint64_t timestamp) -> void { wbFreeSignal = timestamp + 1; }
+  auto setWbFreeSignal(uint64_t timestamp) -> void {
+    wbFreeSignal = timestamp + 1;
+  }
 
   void setVsetSignal(uint64_t timestamp) { vsetSignal = timestamp - 1; }
   auto getVsetSignal() -> uint64_t { return vsetSignal; };
@@ -215,14 +225,27 @@ public:
   }
   auto getMemArbiterSignal() -> uint64_t { return memArbiterSignal; };
 
+  auto setCommitSignal(uint64_t timestamp) -> void { commitSignal = timestamp; }
+  auto getCommitSignal() -> uint64_t { return commitSignal; }
+
+  auto setDispatch1Ready(uint64_t timestamp) -> void {
+    dispatch_1_ready = timestamp;
+  }
+
+  auto setDispatch2Ready(uint64_t timestamp) -> void {
+    dispatch_2_ready = timestamp;
+  }
+
   // Get the max. timestamp for a target register group
   uint64_t getMaxVdGroup(void) {
     auto const emul = getLmul();
     auto const registerBaseIndex = getVdIndex();
-    auto start = vectorRegisterWrites.begin() + registerBaseIndex;
+    auto const start = vectorRegisterWrites.begin() + registerBaseIndex;
     // Ready 1 cycle after register done
-    return std::max((*(std::max_element(start, start + emul))) + 1,
-                    dispatch_2_ready);
+    auto const max_elm = *(std::max_element(start, start + emul));
+    // std::printf("WAW: Max. v%lu - v%lu = %lu\n", registerBaseIndex,
+    //             registerBaseIndex + emul - 1, max_elm);
+    return max_elm;
   }
 
   uint64_t getMaxVdGroupWide(void) {
@@ -230,7 +253,7 @@ public:
     auto const registerBaseIndex = getVdIndex();
     auto start = vectorRegisterWrites.begin() + registerBaseIndex;
     // Ready 1 cycle after register done
-    return (*(std::max_element(start, start + emul))) + 1;
+    return (*(std::max_element(start, start + emul)));
   }
 
   // Get the max. timestamp for a register group based on nf
@@ -239,7 +262,7 @@ public:
     auto const registerBaseIndex = getVdIndex();
     auto start = vectorRegisterWrites.begin() + registerBaseIndex;
     // Ready 1 cycle after register done
-    return std::max((*(std::max_element(start, start + nFields))) + 1,
+    return std::max((*(std::max_element(start, start + nFields))),
                     dispatch_1_ready);
   }
 
@@ -253,7 +276,7 @@ public:
     auto const registerBaseIndex = getVdIndex();
     auto start = vectorRegisterWrites.begin() + registerBaseIndex;
     // Ready 1 cycle after register done
-    return std::max((*(std::max_element(start, start + emul))) + 1,
+    return std::max((*(std::max_element(start, start + emul))),
                     dispatch_1_ready);
   }
 

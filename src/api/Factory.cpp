@@ -99,9 +99,9 @@ Channel* Factory::getChannel(int var_)
 	case AssemblyTrace: return new AssemblyTrace_Channel();
 	case Vicuna_zvl64b: return new Vicuna_zvl64b_Channel();
 	case Vicuna_zvl128b: return new Vicuna_zvl128b_Channel();
-	case Vicuna_zvl256b: return new Vicuna_zvl128b_Channel();
-	case Vicuna_zvl512b: return new Vicuna_zvl128b_Channel();
-	case Vicuna_zvl1024b: return new Vicuna_zvl128b_Channel();
+	case Vicuna_zvl256b: return new Vicuna_zvl256b_Channel();
+	case Vicuna_zvl512b: return new Vicuna_zvl512b_Channel();
+	case Vicuna_zvl1024b: return new Vicuna_zvl1024b_Channel();
 
     default: return nullptr;
   }
@@ -126,16 +126,16 @@ Backend* Factory::getPerformanceEstimator(int var_)
 		perfModel = new Vicuna_zvl64b::Vicuna_zvl64b_PerformanceModel();
 		break;
 	case Vicuna_zvl128b:
-		perfModel = new Vicuna_zvl64b::Vicuna_zvl64b_PerformanceModel();
+		perfModel = new Vicuna_zvl128b::Vicuna_zvl128b_PerformanceModel();
 		break;
 	case Vicuna_zvl256b:
-		perfModel = new Vicuna_zvl64b::Vicuna_zvl64b_PerformanceModel();
+		perfModel = new Vicuna_zvl256b::Vicuna_zvl256b_PerformanceModel();
 		break;
 	case Vicuna_zvl512b:
-		perfModel = new Vicuna_zvl64b::Vicuna_zvl64b_PerformanceModel();
+		perfModel = new Vicuna_zvl512b::Vicuna_zvl512b_PerformanceModel();
 		break;
 	case Vicuna_zvl1024b:
-		perfModel = new Vicuna_zvl64b::Vicuna_zvl64b_PerformanceModel();
+		perfModel = new Vicuna_zvl1024b::Vicuna_zvl1024b_PerformanceModel();
 		break;
 
     default: perfModel = nullptr;
